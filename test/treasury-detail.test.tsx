@@ -48,11 +48,18 @@ vi.mock('@/lib/dao-client', () => ({
     getTreasuryProposal: (...a: unknown[]) => mockGetTreasuryProposal(...a),
     hasVoted: (...a: unknown[]) => mockHasVoted(...a),
     getDocument: vi.fn().mockResolvedValue(null),
+    getToken: vi.fn().mockResolvedValue('CTOKEN'),
     getTotalMembers: vi.fn().mockResolvedValue(10),
     getActiveMembers: vi.fn().mockResolvedValue(8),
     getConsensusThreshold: vi.fn().mockResolvedValue(5100),
     getTreasuryBalance: vi.fn().mockResolvedValue(BigInt(1000000000)),
     isPaused: vi.fn().mockResolvedValue(false),
+  },
+  tokenRead: {
+    getSymbol: vi.fn().mockResolvedValue('OUSD'),
+    getDecimals: vi.fn().mockResolvedValue(7),
+    getName: vi.fn().mockResolvedValue('OurDAO USD'),
+    getBalance: vi.fn().mockResolvedValue(BigInt(0)),
   },
   daoWrite: () => ({
     voteOnTreasuryProposal: (...a: unknown[]) => mockVoteOnTreasury(...a),
@@ -100,7 +107,7 @@ describe('TreasuryProposalDetailPage (/treasury/[id])', () => {
       expect(screen.getAllByText(/Treasury Proposal #42/)[0]).toBeInTheDocument()
     })
 
-    expect(screen.getByText('5 TOKEN')).toBeInTheDocument() // 50000000 stroops = 5 TOKEN
+    expect(await screen.findByText('5 OUSD')).toBeInTheDocument() // 50000000 stroops = 5 tokens
     expect(screen.getByText(/GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5/)).toBeInTheDocument()
     expect(screen.getByText('In Voting')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Vote For/i })).toBeInTheDocument()
@@ -216,17 +223,69 @@ describe('TreasuryProposalDetailPage (/treasury/[id])', () => {
   })
 
   describe('private commit-reveal salt backup (#546)', () => {
+    // Raw contract shape (see treasuryProposalSchema): the mapper reads
+    // `private`, `for_votes`, `against_votes`, not the UI field names.
+    const privateProposal = {
+      id: 42,
+      proposer: 'GPROPOSER',
+      destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+      reason: 'Treasury Proposal #42',
+      amount: '50000000',
+      status: 'Pending',
+      for_votes: '0',
+      against_votes: '0',
+      created_at: 0,
+      private: true,
+    }
+
+    beforeEach(() => {
+      localStorage.clear()
+    })
+
+    // #519: the commit transaction must not be sendable until the salt backup
+    // has been downloaded.
+    it('keeps the commit button disabled until the salt backup is downloaded', async () => {
+      const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:salt-backup')
+      vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+      vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+      mockGetTreasuryProposal.mockResolvedValue(privateProposal)
+      mockHasVoted.mockResolvedValue(false)
+
+      renderWithProviders(<TreasuryProposalDetailPage />)
+
+      fireEvent.click(await screen.findByRole('button', { name: /Commit FOR/i }))
+
+      const commitButton = await screen.findByRole('button', { name: /Step 2: Commit Vote/i })
+      expect(commitButton).toBeDisabled()
+
+      fireEvent.click(screen.getByRole('button', { name: /Step 1: Download salt backup/i }))
+
+      await waitFor(() => expect(screen.getByRole('button', { name: /Step 2: Commit Vote/i })).toBeEnabled())
+      expect(createObjectURL).toHaveBeenCalledTimes(1)
+    })
+
+    // #518: a member whose local salt is missing must still be able to import
+    // the backup and reach the reveal buttons.
+    it('offers a salt import when the vote is committed but no salt is stored, and reveals after import', async () => {
+      mockGetTreasuryProposal.mockResolvedValue(privateProposal)
+      mockHasVoted.mockResolvedValue(true)
+
+      renderWithProviders(<TreasuryProposalDetailPage />)
+
+      await screen.findByText(/salt not found/i)
+      expect(screen.queryByRole('button', { name: /Reveal FOR/i })).not.toBeInTheDocument()
+
+      const input = document.querySelector('input[type="file"]') as HTMLInputElement
+      expect(input).not.toBeNull()
+      const backup = JSON.stringify({ proposalId: 42, address: 'GALICE', salt: '00'.repeat(32) })
+      const file = new File([backup], 'salt.json', { type: 'application/json' })
+      fireEvent.change(input, { target: { files: [file] } })
+
+      expect(await screen.findByRole('button', { name: /Reveal FOR/i })).toBeInTheDocument()
+    })
+
     it('backs up the exact salt used to compute the on-chain commitment and calls generateCommitment once', async () => {
-      mockGetTreasuryProposal.mockResolvedValue({
-        id: 42,
-        destination: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-        reason: 'Private Treasury Proposal #42',
-        amount: '50000000',
-        status: 'Pending',
-        votesFor: '0',
-        votesAgainst: '0',
-        private: true,
-      })
+      mockGetTreasuryProposal.mockResolvedValue(privateProposal)
 
       const generateCommitmentSpy = vi.spyOn(utils, 'generateCommitment')
       vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
@@ -244,7 +303,8 @@ describe('TreasuryProposalDetailPage (/treasury/[id])', () => {
         renderWithProviders(<TreasuryProposalDetailPage />)
 
         fireEvent.click(await screen.findByRole('button', { name: /Commit FOR/i }))
-        fireEvent.click(await screen.findByRole('button', { name: /Commit Vote & Download Salt/i }))
+        fireEvent.click(await screen.findByRole('button', { name: /Step 1: Download salt backup/i }))
+        fireEvent.click(await screen.findByRole('button', { name: /Step 2: Commit Vote/i }))
 
         await waitFor(() => {
           expect(mockCommitTreasuryVote).toHaveBeenCalledTimes(1)
